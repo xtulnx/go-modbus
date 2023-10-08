@@ -4,10 +4,46 @@ import (
 	"fmt"
 )
 
+type PDU interface {
+	GetUnitId() uint8
+	GetFunctionCode() uint8
+	GetPayload() []byte
+	SetPayload([]byte)
+	Resp([]byte) PDU
+}
+
 type pdu struct {
 	unitId		uint8
 	functionCode	uint8
 	payload		[]byte
+}
+
+func (p *pdu) GetUnitId() uint8 {
+	return p.unitId
+}
+
+func (p *pdu) GetFunctionCode() uint8 {
+	return p.functionCode
+}
+
+func (p *pdu) GetPayload() []byte {
+	return p.payload
+}
+
+func (p *pdu) SetPayload(payload []byte) {
+	p.payload = payload
+}
+
+func (p *pdu) Resp(payload []byte) PDU {
+	return &pdu{unitId: p.unitId, functionCode: p.functionCode, payload: payload}
+}
+
+func NewPDU(unitId, functionCode uint8, payload []byte) PDU {
+	return &pdu{
+		unitId:       unitId,
+		functionCode: functionCode,
+		payload:      payload,
+	}
 }
 
 type Error string

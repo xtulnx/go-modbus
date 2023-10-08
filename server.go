@@ -149,6 +149,9 @@ type ModbusServer struct {
 	tcpListener	net.Listener
 	tcpClients	[]net.Conn
 	transportType	transportType
+
+	tcpClientsMap map[string]net.Conn
+	function      [256]FunctionHandler
 }
 
 // Returns a new modbus server.
@@ -162,7 +165,19 @@ func NewServer(conf *ServerConfiguration, reqHandler RequestHandler) (
 	ms = &ModbusServer{
 		conf:		*conf,
 		handler:	reqHandler,
+
+		tcpClients:    []net.Conn{},
+		tcpClientsMap: map[string]net.Conn{},
 	}
+
+	ms.function[fcReadCoils] = ms.fnReadCoils
+	ms.function[fcReadDiscreteInputs] = ms.fnReadCoils
+	ms.function[fcWriteSingleCoil] = ms.fnWriteSingleCoil
+	ms.function[fcWriteMultipleCoils] = ms.fnWriteMultipleCoils
+	ms.function[fcReadHoldingRegisters] = ms.fnReadHoldingRegisters
+	ms.function[fcReadInputRegisters] = ms.fnReadHoldingRegisters
+	ms.function[fcWriteSingleRegister] = ms.fnWriteSingleRegister
+	ms.function[fcWriteMultipleRegisters] = ms.fnWriteMultipleRegisters
 
 	splitURL = strings.SplitN(ms.conf.URL, "://", 2)
 	if len(splitURL) == 2 {
@@ -274,9 +289,19 @@ func (ms *ModbusServer) Stop() (err error) {
 		for _, sock := range ms.tcpClients{
 			sock.Close()
 		}
+
+		ms.tcpClients = ms.tcpClients[0:0]
+		ms.tcpClientsMap = map[string]net.Conn{}
 	}
 
 	return
+}
+
+func (ms *ModbusServer) FindConn(addr string) net.Conn {
+	ms.lock.Lock()
+	defer ms.lock.Unlock()
+	c, _ := ms.tcpClientsMap[addr]
+	return c
 }
 
 // Accepts new client connections if the configured connection limit allows it.
@@ -305,6 +330,7 @@ func (ms *ModbusServer) acceptTCPClients() {
 			accepted = true
 			// add the new client connection to the pool
 			ms.tcpClients = append(ms.tcpClients, sock)
+			ms.tcpClientsMap[sock.RemoteAddr().String()] = sock
 		} else {
 			accepted = false
 		}
@@ -367,6 +393,12 @@ func (ms *ModbusServer) handleTCPClient(sock net.Conn) {
 			break
 		}
 	}
+	for k, v := range ms.tcpClientsMap {
+		if v == sock {
+			delete(ms.tcpClientsMap, k)
+			break
+		}
+	}
 	ms.lock.Unlock()
 
 	// close the connection
@@ -380,10 +412,8 @@ func (ms *ModbusServer) handleTCPClient(sock net.Conn) {
 // to the transport.
 func (ms *ModbusServer) handleTransport(t transport, clientAddr string, clientRole string) {
 	var req		*pdu
-	var res		*pdu
+	var res PDU
 	var err		error
-	var addr	uint16
-	var quantity	uint16
 
 	for {
 		req, err = t.ReadRequest()
@@ -391,371 +421,9 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string, clientRo
 			return
 		}
 
-		switch req.functionCode {
-		case fcReadCoils, fcReadDiscreteInputs:
-			var coils	[]bool
-			var resCount	int
-
-			if len(req.payload) != 4 {
-				err = ErrProtocolError
-				break
-			}
-
-			// decode address and quantity fields
-			addr		= bytesToUint16(BIG_ENDIAN, req.payload[0:2])
-			quantity	= bytesToUint16(BIG_ENDIAN, req.payload[2:4])
-
-			// ensure the reply never exceeds the maximum PDU length and we
-			// never read past 0xffff
-			if quantity > 2000 || quantity == 0 {
-				err	= ErrProtocolError
-				break
-			}
-			if uint32(addr) + uint32(quantity) - 1 > 0xffff {
-				err	= ErrIllegalDataAddress
-				break
-			}
-
-			// invoke the appropriate handler
-			if req.functionCode == fcReadCoils {
-				coils, err	= ms.handler.HandleCoils(&CoilsRequest{
-					ClientAddr: clientAddr,
-					ClientRole: clientRole,
-					UnitId:     req.unitId,
-					Addr:       addr,
-					Quantity:   quantity,
-					IsWrite:    false,
-					Args:       nil,
-				})
+		if fn := ms.function[req.functionCode]; fn != nil {
+			res, err = fn(ms, clientAddr, clientRole, req)
 			} else {
-				coils, err	= ms.handler.HandleDiscreteInputs(
-					&DiscreteInputsRequest{
-						ClientAddr: clientAddr,
-						ClientRole: clientRole,
-						UnitId:     req.unitId,
-						Addr:       addr,
-						Quantity:   quantity,
-					})
-			}
-			resCount	= len(coils)
-
-			// make sure the handler returned the expected number of items
-			if err == nil && resCount != int(quantity) {
-				ms.logger.Errorf("handler returned %v bools, " +
-					         "expected %v", resCount, quantity)
-				err = ErrServerDeviceFailure
-				break
-			}
-
-			if err != nil {
-				break
-			}
-
-			// assemble a response PDU
-			res = &pdu{
-				unitId:		req.unitId,
-				functionCode:	req.functionCode,
-				payload:	[]byte{0},
-			}
-
-			// byte count (1 byte for 8 coils)
-			res.payload[0]	= uint8(resCount / 8)
-			if resCount % 8 != 0 {
-				res.payload[0]++
-			}
-
-			// coil values
-			res.payload	= append(res.payload, encodeBools(coils)...)
-
-		case fcWriteSingleCoil:
-			if len(req.payload) != 4 {
-				err = ErrProtocolError
-				break
-			}
-
-			// decode the address field
-			addr	= bytesToUint16(BIG_ENDIAN, req.payload[0:2])
-
-			// validate the value field (should be either 0xff00 or 0x0000)
-			if ((req.payload[2] != 0xff && req.payload[2] != 0x00) ||
-			    req.payload[3] != 0x00) {
-				err = ErrProtocolError
-				break
-			}
-
-			// invoke the coil handler
-			_, err	= ms.handler.HandleCoils(&CoilsRequest{
-				ClientAddr: clientAddr,
-				ClientRole: clientRole,
-				UnitId:     req.unitId,
-				Addr:       addr,
-				Quantity:   1, // request for a single coil
-				IsWrite:    true, // this is a write request
-				Args:       []bool{(req.payload[2] == 0xff)},
-			})
-
-			if err != nil {
-				break
-			}
-
-			// assemble a response PDU
-			res = &pdu{
-				unitId:		req.unitId,
-				functionCode:	req.functionCode,
-			}
-
-			// echo the address and value in the response
-			res.payload	= append(res.payload,
-						 uint16ToBytes(BIG_ENDIAN, addr)...)
-			res.payload	= append(res.payload,
-						 req.payload[2], req.payload[3])
-
-		case fcWriteMultipleCoils:
-			var expectedLen	int
-
-			if len(req.payload) < 6 {
-				err = ErrProtocolError
-				break
-			}
-
-			// decode address and quantity fields
-			addr		= bytesToUint16(BIG_ENDIAN, req.payload[0:2])
-			quantity	= bytesToUint16(BIG_ENDIAN, req.payload[2:4])
-
-			// ensure the reply never exceeds the maximum PDU length and we
-			// never read past 0xffff
-			if quantity > 0x7b0 || quantity == 0 {
-				err	= ErrProtocolError
-				break
-			}
-			if uint32(addr) + uint32(quantity) - 1 > 0xffff {
-				err	= ErrIllegalDataAddress
-				break
-			}
-
-			// validate the byte count field (1 byte for 8 coils)
-			expectedLen	= int(quantity) / 8
-			if quantity % 8 != 0 {
-				expectedLen++
-			}
-
-			if req.payload[4] != uint8(expectedLen) {
-				err	= ErrProtocolError
-				break
-			}
-
-			// make sure we have enough bytes
-			if len(req.payload) - 5 != expectedLen {
-				err	= ErrProtocolError
-				break
-			}
-
-			// invoke the coil handler
-			_, err	= ms.handler.HandleCoils(&CoilsRequest{
-				ClientAddr: clientAddr,
-				ClientRole: clientRole,
-				UnitId:     req.unitId,
-				Addr:       addr,
-				Quantity:   quantity,
-				IsWrite:    true, // this is a write request
-				Args:       decodeBools(quantity, req.payload[5:]),
-			})
-
-			if err != nil {
-				break
-			}
-
-			// assemble a response PDU
-			res = &pdu{
-				unitId:		req.unitId,
-				functionCode:	req.functionCode,
-			}
-
-			// echo the address and quantity in the response
-			res.payload	= append(res.payload,
-						 uint16ToBytes(BIG_ENDIAN, addr)...)
-			res.payload	= append(res.payload,
-						 uint16ToBytes(BIG_ENDIAN, quantity)...)
-
-		case fcReadHoldingRegisters, fcReadInputRegisters:
-			var regs	[]uint16
-			var resCount	int
-
-			if len(req.payload) != 4 {
-				err = ErrProtocolError
-				break
-			}
-
-			// decode address and quantity fields
-			addr		= bytesToUint16(BIG_ENDIAN, req.payload[0:2])
-			quantity	= bytesToUint16(BIG_ENDIAN, req.payload[2:4])
-
-			// ensure the reply never exceeds the maximum PDU length and we
-			// never read past 0xffff
-			if quantity > 0x007d || quantity == 0 {
-				err	= ErrProtocolError
-				break
-			}
-			if uint32(addr) + uint32(quantity) - 1 > 0xffff {
-				err	= ErrIllegalDataAddress
-				break
-			}
-
-			// invoke the appropriate handler
-			if req.functionCode == fcReadHoldingRegisters {
-				regs, err	= ms.handler.HandleHoldingRegisters(
-					&HoldingRegistersRequest{
-						ClientAddr: clientAddr,
-						ClientRole: clientRole,
-						UnitId:     req.unitId,
-						Addr:       addr,
-						Quantity:   quantity,
-						IsWrite:    false,
-						Args:       nil,
-					})
-			} else {
-				regs, err	= ms.handler.HandleInputRegisters(
-					&InputRegistersRequest{
-						ClientAddr: clientAddr,
-						ClientRole: clientRole,
-						UnitId:     req.unitId,
-						Addr:       addr,
-						Quantity:   quantity,
-					})
-			}
-			resCount	= len(regs)
-
-			// make sure the handler returned the expected number of items
-			if err == nil && resCount != int(quantity) {
-				ms.logger.Errorf("handler returned %v 16-bit values, " +
-					         "expected %v", resCount, quantity)
-				err = ErrServerDeviceFailure
-				break
-			}
-
-			if err != nil {
-				break
-			}
-
-			// assemble a response PDU
-			res = &pdu{
-				unitId:		req.unitId,
-				functionCode:	req.functionCode,
-				payload:	[]byte{0},
-			}
-
-			// byte count (2 bytes per register)
-			res.payload[0]	= uint8(resCount * 2)
-
-			// register values
-			res.payload	= append(res.payload,
-						 uint16sToBytes(BIG_ENDIAN, regs)...)
-
-		case fcWriteSingleRegister:
-			var value	uint16
-
-			if len(req.payload) != 4 {
-				err = ErrProtocolError
-				break
-			}
-
-			// decode address and value fields
-			addr	= bytesToUint16(BIG_ENDIAN, req.payload[0:2])
-			value	= bytesToUint16(BIG_ENDIAN, req.payload[2:4])
-
-			// invoke the handler
-			_, err	= ms.handler.HandleHoldingRegisters(
-				&HoldingRegistersRequest{
-					ClientAddr: clientAddr,
-					ClientRole: clientRole,
-					UnitId:     req.unitId,
-					Addr:       addr,
-					Quantity:   1, // request for a single register
-					IsWrite:    true, // request is a write
-					Args:       []uint16{value},
-				})
-
-			if err != nil {
-				break
-			}
-
-			// assemble a response PDU
-			res = &pdu{
-				unitId:		req.unitId,
-				functionCode:	req.functionCode,
-			}
-
-			// echo the address and value in the response
-			res.payload	= append(res.payload,
-						 uint16ToBytes(BIG_ENDIAN, addr)...)
-			res.payload	= append(res.payload,
-						 uint16ToBytes(BIG_ENDIAN, value)...)
-
-		case fcWriteMultipleRegisters:
-			var expectedLen	int
-
-			if len(req.payload) < 6 {
-				err = ErrProtocolError
-				break
-			}
-
-			// decode address and quantity fields
-			addr		= bytesToUint16(BIG_ENDIAN, req.payload[0:2])
-			quantity	= bytesToUint16(BIG_ENDIAN, req.payload[2:4])
-
-			// ensure the reply never exceeds the maximum PDU length and we
-			// never read past 0xffff
-			if quantity > 0x007b || quantity == 0 {
-				err	= ErrProtocolError
-				break
-			}
-			if uint32(addr) + uint32(quantity) - 1 > 0xffff {
-				err	= ErrIllegalDataAddress
-				break
-			}
-
-			// validate the byte count field (2 bytes per register)
-			expectedLen	= int(quantity) * 2
-
-			if req.payload[4] != uint8(expectedLen) {
-				err	= ErrProtocolError
-				break
-			}
-
-			// make sure we have enough bytes
-			if len(req.payload) - 5 != expectedLen {
-				err	= ErrProtocolError
-				break
-			}
-
-			// invoke the holding register handler
-			_, err		= ms.handler.HandleHoldingRegisters(
-				&HoldingRegistersRequest{
-					ClientAddr: clientAddr,
-					ClientRole: clientRole,
-					UnitId:     req.unitId,
-					Addr:       addr,
-					Quantity:   quantity,
-					IsWrite:    true, // this is a write request
-					Args:       bytesToUint16s(BIG_ENDIAN, req.payload[5:]),
-				})
-			if err != nil {
-				break
-			}
-
-			// assemble a response PDU
-			res = &pdu{
-				unitId:		req.unitId,
-				functionCode:	req.functionCode,
-			}
-
-			// echo the address and quantity in the response
-			res.payload	= append(res.payload,
-						 uint16ToBytes(BIG_ENDIAN, addr)...)
-			res.payload	= append(res.payload,
-						 uint16ToBytes(BIG_ENDIAN, quantity)...)
-
-		default:
 			res = &pdu{
 				// reply with the request target unit ID
 				unitId:		req.unitId,
@@ -795,7 +463,17 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string, clientRo
 		}
 
 		// write the response to the transport
-		err	= t.WriteResponse(res)
+		var r0 *pdu
+		if r1, ok := res.(*pdu); ok {
+			r0 = r1
+		} else {
+			r0 = &pdu{
+				unitId:       res.GetUnitId(),
+				functionCode: res.GetFunctionCode(),
+				payload:      res.GetPayload(),
+			}
+		}
+		err = t.WriteResponse(r0)
 		if err != nil {
 			ms.logger.Warningf("failed to write response: %v", err)
 		}
