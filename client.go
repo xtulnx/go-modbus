@@ -1179,6 +1179,18 @@ func (mc *ModbusClient) writeRegisters(addr uint16, values []byte) (err error) {
 	return
 }
 
+func (mc *ModbusClient) SendRequest(req PDU) (res PDU, err error) {
+	req1, ok := req.(*pdu)
+	if !ok {
+		req1 = &pdu{
+			unitId:       req.GetUnitId(),
+			functionCode: req.GetFunctionCode(),
+			payload:      req.GetPayload(),
+		}
+	}
+	return mc.executeRequest(req1)
+}
+
 func (mc *ModbusClient) executeRequest(req *pdu) (res *pdu, err error) {
 	// send the request over the wire, wait for and decode the response
 	res, err	= mc.transport.ExecuteRequest(req)

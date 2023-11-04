@@ -2,7 +2,7 @@ package modbus
 
 type FunctionHandler func(S *ModbusServer, clientAddr, clientRole string, req PDU) (res PDU, err error)
 
-func (ms *ModbusServer) RegisterFunction(functionCode uint8, handler FunctionHandler) {
+func (ms *ModbusServer) RegisterFunctionHandler(functionCode uint8, handler FunctionHandler) {
 	ms.function[functionCode] = handler
 }
 

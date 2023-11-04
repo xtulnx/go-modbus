@@ -36,6 +36,11 @@ type ServerConfiguration struct {
 	// Logger provides a custom sink for log messages.
 	// If nil, messages will be written to stdout.
 	Logger        *log.Logger
+
+	// 建立连接时的回调函数
+	OnConnected func(ms *ModbusServer, clientAddr string, clientRole string, sock net.Conn) error
+	// 断开连接时的回调函数
+	OnDisconnected func(ms *ModbusServer, clientAddr string, clientRole string, sock net.Conn)
 }
 
 // Request object passed to the coil handler.
@@ -151,6 +156,7 @@ type ModbusServer struct {
 	transportType	transportType
 
 	tcpClientsMap map[string]net.Conn
+	tcpWatchDogStat map[string]int
 	function      [256]FunctionHandler
 }
 
@@ -168,6 +174,7 @@ func NewServer(conf *ServerConfiguration, reqHandler RequestHandler) (
 
 		tcpClients:    []net.Conn{},
 		tcpClientsMap: map[string]net.Conn{},
+		tcpWatchDogStat: map[string]int{},
 	}
 
 	ms.function[fcReadCoils] = ms.fnReadCoils
@@ -286,22 +293,99 @@ func (ms *ModbusServer) Stop() (err error) {
 		err	= ms.tcpListener.Close()
 
 		// close all active TCP clients
-		for _, sock := range ms.tcpClients{
-			sock.Close()
+		fnOnDisconnected := ms.conf.OnDisconnected
+		for _, sock := range ms.tcpClients {
+			e1 := sock.Close()
+			if e1 == nil && fnOnDisconnected != nil {
+				fnOnDisconnected(ms, sock.RemoteAddr().String(), "", sock)
+			}
 		}
 
 		ms.tcpClients = ms.tcpClients[0:0]
 		ms.tcpClientsMap = map[string]net.Conn{}
+		ms.tcpWatchDogStat = map[string]int{}
 	}
 
 	return
 }
 
+func (ms *ModbusServer) Close() error {
+	return ms.Stop()
+}
+
 func (ms *ModbusServer) FindConn(addr string) net.Conn {
 	ms.lock.Lock()
 	defer ms.lock.Unlock()
+	if !ms.started {
+		return nil
+	}
 	c, _ := ms.tcpClientsMap[addr]
 	return c
+}
+
+func (ms *ModbusServer) watchDogRun(clientAddr string, timeout time.Duration) {
+	time.Sleep(timeout)
+	if !ms.started {
+		return
+	}
+	if t1, ok1 := ms.tcpWatchDogStat[clientAddr]; t1 != 1 && !ok1 {
+		return
+	}
+	if c1, ok1 := ms.tcpClientsMap[clientAddr]; c1 != nil && ok1 {
+		ms.CloseConn(c1)
+	}
+}
+
+// WatchDog 定时自动关闭连接
+func (ms *ModbusServer) WatchDog(clientAddr string, timeout time.Duration) {
+	ms.lock.Lock()
+	defer ms.lock.Unlock()
+	if !ms.started {
+		return
+	}
+	if _, ok := ms.tcpClientsMap[clientAddr]; ok {
+		if _, ok1 := ms.tcpWatchDogStat[clientAddr]; !ok1 {
+			ms.tcpWatchDogStat[clientAddr] = 1
+			go ms.watchDogRun(clientAddr, timeout)
+		}
+	}
+}
+
+// WatchDogCancel 取消WatchDog
+func (ms *ModbusServer) WatchDogCancel(clientAddr string) {
+	ms.lock.Lock()
+	defer ms.lock.Unlock()
+	if !ms.started {
+		return
+	}
+	delete(ms.tcpWatchDogStat, clientAddr)
+}
+
+// CloseConn 关闭连接
+func (ms *ModbusServer) CloseConn(c net.Conn) {
+	if c == nil {
+		return
+	}
+	ms.lock.Lock()
+	defer ms.lock.Unlock()
+	if !ms.started {
+		return
+	}
+	for i := range ms.tcpClients {
+		if ms.tcpClients[i] == c {
+			ms.tcpClients[i] = ms.tcpClients[len(ms.tcpClients)-1]
+			ms.tcpClients = ms.tcpClients[:len(ms.tcpClients)-1]
+			break
+		}
+	}
+	for k, v := range ms.tcpClientsMap {
+		if v == c {
+			delete(ms.tcpClientsMap, k)
+		}
+	}
+	if e1 := c.Close(); e1 != nil && ms.conf.OnDisconnected != nil {
+		ms.conf.OnDisconnected(ms, c.RemoteAddr().String(), "", c)
+	}
 }
 
 // Accepts new client connections if the configured connection limit allows it.
@@ -343,7 +427,7 @@ func (ms *ModbusServer) acceptTCPClients() {
 			ms.logger.Warningf("max. number of concurrent connections " +
 					   "reached, rejecting %v", sock.RemoteAddr())
 			// discard the connection
-			sock.Close()
+			_ = sock.Close()
 		}
 	}
 
@@ -359,6 +443,14 @@ func (ms *ModbusServer) handleTCPClient(sock net.Conn) {
 	var err        error
 	var clientRole string
 	var tlsSock    net.Conn
+
+	if ms.conf.OnConnected != nil {
+		err = ms.conf.OnConnected(ms, sock.RemoteAddr().String(), "", sock)
+		if err != nil {
+			ms.CloseConn(sock)
+			return
+		}
+	}
 
 	switch ms.transportType {
 	case modbusTCP:
@@ -385,24 +477,7 @@ func (ms *ModbusServer) handleTCPClient(sock net.Conn) {
 	}
 
 	// once done, remove our connection from the list of active client conns
-	ms.lock.Lock()
-	for i := range ms.tcpClients {
-		if ms.tcpClients[i] == sock {
-			ms.tcpClients[i] = ms.tcpClients[len(ms.tcpClients)-1]
-			ms.tcpClients	 = ms.tcpClients[:len(ms.tcpClients)-1]
-			break
-		}
-	}
-	for k, v := range ms.tcpClientsMap {
-		if v == sock {
-			delete(ms.tcpClientsMap, k)
-			break
-		}
-	}
-	ms.lock.Unlock()
-
-	// close the connection
-	sock.Close()
+	ms.CloseConn(sock)
 
 	return
 }
@@ -451,7 +526,7 @@ func (ms *ModbusServer) handleTransport(t transport, clientAddr string, clientRo
 				ms.logger.Warningf(
 					"protocol error, closing link (client address: '%s')",
 					clientAddr)
-				t.Close()
+				_ = t.Close()
 				return
 			} else {
 				res = &pdu{
